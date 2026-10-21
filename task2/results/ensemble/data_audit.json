@@ -1,0 +1,26 @@
+{
+  "train_count": 28275,
+  "test_count": 7065,
+  "class_to_id": {
+    "Angry": 0,
+    "Fear": 1,
+    "Happy": 2,
+    "Sad": 3,
+    "Surprise": 4,
+    "Neutral": 5
+  },
+  "class_counts": {
+    "Angry": 3963,
+    "Fear": 4097,
+    "Happy": 7192,
+    "Sad": 4862,
+    "Surprise": 3202,
+    "Neutral": 4959
+  },
+  "image_formats": {
+    "48x48:L": 35340
+  },
+  "duplicate_train_images": 1194,
+  "conflicting_duplicate_groups": 39,
+  "test_images_also_in_train": 520
+}

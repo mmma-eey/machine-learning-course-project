@@ -1,0 +1,73 @@
+{
+  "individual_oof_accuracy": {
+    "convnext": 0.7032441056550257
+  },
+  "selected_oof_accuracy": 0.7032441056550257,
+  "weights": {
+    "convnext": 1.0
+  },
+  "class_to_id": {
+    "Angry": 0,
+    "Fear": 1,
+    "Happy": 2,
+    "Sad": 3,
+    "Surprise": 4,
+    "Neutral": 5
+  },
+  "confusion_matrix": [
+    [
+      521,
+      68,
+      29,
+      89,
+      14,
+      94
+    ],
+    [
+      99,
+      430,
+      26,
+      132,
+      66,
+      72
+    ],
+    [
+      9,
+      15,
+      1284,
+      23,
+      26,
+      56
+    ],
+    [
+      80,
+      122,
+      37,
+      549,
+      15,
+      192
+    ],
+    [
+      15,
+      70,
+      29,
+      9,
+      487,
+      20
+    ],
+    [
+      39,
+      44,
+      69,
+      106,
+      9,
+      696
+    ]
+  ],
+  "exact_match_count": 511,
+  "validation_count": 5641,
+  "selected_folds": [
+    0
+  ],
+  "note": "仅对所选验证划分评估；用于选择阶段/TTA，不是完全独立的最终测试成绩。"
+}

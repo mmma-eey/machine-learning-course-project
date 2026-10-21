@@ -1,0 +1,37 @@
+{
+  "signature": "858f4c005d2c82c9ad6add8abee85a45e1b223f624ff95e5d8724b8a860a0438",
+  "config": {
+    "n_folds": 5,
+    "epochs": 20,
+    "finetune_epochs": 5,
+    "batch_per_gpu": 8,
+    "accum": 8,
+    "backbone": "tiny",
+    "grad_checkpoint": false,
+    "patience": 6,
+    "workers": 0,
+    "seed": 2026,
+    "no_exact_match": false,
+    "specs": [
+      {
+        "key": "convnext",
+        "name": "convnext_tiny.fb_in22k_ft_in1k",
+        "size": 224,
+        "final_size": 288,
+        "lr": 8e-05,
+        "head_mult": 5.0
+      }
+    ],
+    "labels": {
+      "Angry": 0,
+      "Fear": 1,
+      "Happy": 2,
+      "Sad": 3,
+      "Surprise": 4,
+      "Neutral": 5
+    },
+    "manifest": "638e9a2310b112f22ed9d7b86a47fe53fca7418d0e82dccd4b6ac9bb8b6ec3b3",
+    "test_ids": "399e2525bf75ccbf0dc0158ddee49c760d74d0ebf51896932bdd8e2778eae01f",
+    "test_pixels": "8f6ef76f624bedd72ff18da456ca9dc2ed58ae8c6b9c64cd1fdd9a525f17d373"
+  }
+}

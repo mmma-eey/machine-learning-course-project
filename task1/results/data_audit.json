@@ -1,0 +1,29 @@
+{
+  "original_classes": {
+    "Black-grass": 100,
+    "Common wheat": 100,
+    "Loose Silky-bent": 100,
+    "Scentless Mayweed": 100,
+    "Sugar beet": 100
+  },
+  "clean_classes": {
+    "Black-grass": 222,
+    "Common wheat": 191,
+    "Loose Silky-bent": 547,
+    "Scentless Mayweed": 440,
+    "Sugar beet": 313
+  },
+  "test_count": 378,
+  "prediction_counts": {
+    "Sugar beet": 81,
+    "Loose Silky-bent": 136,
+    "Black-grass": 36,
+    "Scentless Mayweed": 90,
+    "Common wheat": 35
+  },
+  "changed_vs_320": 38,
+  "unique_ids": 378,
+  "sha256": "4b6604e58822e3d2338a6a327033b4a56a1a650be42c92773d18e929cddc5b7a",
+  "ids_match_test": true,
+  "clean_exact_overlap_test": 0
+}

@@ -1,0 +1,882 @@
+"""Task2 三模型集成版：复用0.714版本，只新增 fold1、fold2。
+把本文件全部内容复制到 Kaggle 的一个 Code 单元格，点击该单元格运行。
+开启 GPU 与 Internet。默认 ConvNeXt-Tiny（ImageNet-22K 预训练），单卡，复用fold0；fold1、fold2各最多20+5轮。
+默认 /kaggle/input/2026task2；兼容 Kaggle 新挂载目录，自动定位 train/test 和模板。
+输出 /kaggle/working/task2_ensemble3_output/submission.csv。
+无需 import 本文件，无需上传代码数据集，无需使用子进程启动器。
+"""
+print('[单元格] 三模型集成版开始执行；请已添加旧结果数据集', flush=True)
+from pathlib import Path
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import csv
+import gc
+import hashlib
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+
+# 已按用户提供的 Competition Rules 确认，不能用字母排序生成标签。
+CLASS_TO_ID = {"Angry": 0, "Fear": 1, "Happy": 2,
+               "Sad": 3, "Surprise": 4, "Neutral": 5}
+N_CLASSES = 6
+IMAGE_CACHE = {}
+USE_GRAD_CHECKPOINT = False
+RESOURCE_PATH = None
+
+
+def resource_log(label):
+    import shutil
+    stats = {'time': time.time(), 'label': label}
+    try:
+        status = Path('/proc/self/status').read_text()
+        for name in ('VmRSS', 'VmHWM'):
+            stats[name + '_MiB'] = int(status.split(name + ':')[1].split()[0])/1024
+        for name in ('memory.current', 'memory.max'):
+            path = Path('/sys/fs/cgroup') / name
+            if path.exists():
+                val = path.read_text().strip()
+                stats[name] = int(val) if val != 'max' else val
+    except (OSError, IndexError, ValueError):
+        pass
+    if 'torch' in globals() and torch.cuda.is_initialized():
+        stats['GPU_allocated_GiB'] = torch.cuda.memory_allocated(0)/2**30
+        stats['GPU_reserved_GiB'] = torch.cuda.memory_reserved(0)/2**30
+    stats['disk_free_GiB'] = shutil.disk_usage(Path.cwd()).free/2**30
+    print('[资源] ' + json.dumps(stats, ensure_ascii=False), flush=True)
+    if RESOURCE_PATH is not None:
+        with Path(RESOURCE_PATH).open('a', encoding='utf-8') as f:
+            f.write(json.dumps(stats, ensure_ascii=False) + '\n')
+
+
+DEFAULT_ROOT = "/kaggle/input/2026task2"
+DEFAULT_OUT = "/kaggle/working/task2_ensemble3_output"
+SPECS = [
+    dict(key="convnext", name="convnext_tiny.fb_in22k_ft_in1k",
+         size=224, final_size=288, lr=8e-5, head_mult=5.0),
+]
+
+
+@__import__('contextlib').contextmanager
+def activity(label):
+    """阻塞的依赖安装/权重下载期间仍输出心跳。"""
+    import threading
+    stop = threading.Event()
+    began = time.monotonic()
+    print(f'[开始] {label}', flush=True)
+    def heartbeat():
+        while not stop.wait(30):
+            print(f'[等待] {label}，已耗时 {time.monotonic()-began:.0f}s', flush=True)
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
+    print(f'[完成] {label}，耗时 {time.monotonic()-began:.0f}s', flush=True)
+
+
+
+def atomic_json(obj, path):
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def inspect_data(root):
+    """只读取本任务输入，不下载或使用外部 FER 标注数据。"""
+    from PIL import Image
+    root = Path(root)
+    if not root.exists():
+        candidates = [p.parent for p in Path('/kaggle/input').rglob('submission.csv')
+                      if (p.parent / 'fer_data').exists()]
+        preferred = [p for p in candidates if '2026task2' in p.parts]
+        if preferred:
+            candidates = preferred
+        if len(candidates) != 1:
+            raise FileNotFoundError(f"找不到唯一数据根目录 {root}，候选为 {candidates}，请设置 DEFAULT_ROOT")
+        root = candidates[0]
+    print(f'[目录] 数据根目录：{root}', flush=True)
+    candidates = [p for p in root.rglob('train')
+                  if p.is_dir() and (p.parent / 'test').is_dir()]
+    if len(candidates) != 1:
+        raise ValueError(f"期望唯一 train/test 目录对，实际：{candidates}")
+    train_dir, test_dir = candidates[0], candidates[0].parent / 'test'
+    print(f'[目录] train：{train_dir}', flush=True)
+    print(f'[目录] test：{test_dir}', flush=True)
+    folders = {p.name for p in train_dir.iterdir() if p.is_dir()}
+    if folders != set(CLASS_TO_ID):
+        raise ValueError(f"类别文件夹不匹配：{folders}")
+    templates = [root / 'submission.csv'] if (root / 'submission.csv').is_file() else list(root.rglob('submission.csv'))
+    if len(templates) != 1:
+        raise ValueError('期望唯一 submission.csv 模板')
+    print(f'[目录] 提交模板：{templates[0]}', flush=True)
+    with templates[0].open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != ['ID', 'Emotion']:
+            raise ValueError(f"提交列必须为 ID,Emotion，实际 {reader.fieldnames}")
+        ids = [row['ID'] for row in reader]
+    if len(ids) != len(set(ids)):
+        raise ValueError('提交模板 ID 重复')
+    test_paths = {p.name: p for p in test_dir.rglob('*')
+                  if p.suffix.lower() in {'.jpg', '.jpeg', '.png'}}
+    if set(ids) != set(test_paths):
+        raise ValueError('测试图片与模板 ID 集合不一致')
+    rows = []
+    for label, target in CLASS_TO_ID.items():
+        for p in sorted((train_dir / label).iterdir()):
+            if p.suffix.lower() in {'.jpg', '.jpeg', '.png'}:
+                rows.append({'path': str(p), 'target': target})
+
+    def image_info(path):
+        with Image.open(path) as im:
+            im.load()  # 在训练前发现损坏图像
+            gray = im.convert('L')
+            pixels = gray.tobytes()
+            IMAGE_CACHE[str(path)] = (gray.size, pixels)
+            digest = hashlib.sha256(str(gray.size).encode() + pixels).hexdigest()
+            return digest, f'{im.width}x{im.height}:{im.mode}'
+
+    all_paths = [r['path'] for r in rows] + [str(test_paths[i]) for i in ids]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        info = []
+        for i, item in enumerate(pool.map(image_info, all_paths), 1):
+            info.append(item)
+            if i % 5000 == 0 or i == len(all_paths):
+                print(f'[数据检查] {i}/{len(all_paths)} 图片', flush=True)
+    for row, (digest, _) in zip(rows, info):
+        row['group'] = digest
+    groups = defaultdict(set)
+    for row in rows:
+        groups[row['group']].add(row['target'])
+    train_hashes = set(groups)
+    report = dict(train_count=len(rows), test_count=len(ids),
+                  class_to_id=CLASS_TO_ID,
+                  class_counts={k: sum(r['target'] == v for r in rows)
+                                for k, v in CLASS_TO_ID.items()},
+                  image_formats=dict(Counter(fmt for _, fmt in info)),
+                  duplicate_train_images=len(rows) - len(groups),
+                  conflicting_duplicate_groups=sum(len(v) > 1 for v in groups.values()),
+                  test_images_also_in_train=sum(h in train_hashes for h, _ in info[len(rows):]))
+    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+    return rows, [str(test_paths[i]) for i in ids], ids, report, [h for h, _ in info[len(rows):]]
+
+
+def setup_ml(require_cuda=True):
+    # Kaggle 自带 torch/torchvision/numpy/sklearn。只补装 timm，不替换 CUDA 的 torch。
+    import importlib.metadata
+    try:
+        parts = importlib.metadata.version('timm').split('.')
+        adequate = tuple(int(p) for p in parts[:3]) >= (1, 0, 22)
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        adequate = False
+    if not adequate:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+                               'timm>=1.0.22,<1.1'])
+    global np, torch, timm, T, Dataset, DataLoader, StratifiedGroupKFold
+    global ModelEmaV2, resolve_model_data_config, F
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    import timm
+    from torchvision import transforms as T
+    from torch.utils.data import Dataset, DataLoader
+    from sklearn.model_selection import StratifiedGroupKFold
+    from timm.utils import ModelEmaV2
+    from timm.data import resolve_model_data_config
+    if require_cuda and not torch.cuda.is_available():
+        raise RuntimeError('训练需要 CUDA GPU；请在 Kaggle Settings 选择 GPU。')
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    print('torch', torch.__version__, 'timm', timm.__version__, flush=True)
+    print('GPUs:', [torch.cuda.get_device_name(i)
+                    for i in range(torch.cuda.device_count())], flush=True)
+
+
+def seed_all(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(_):
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def make_dataset(paths, targets, transform, crop=1.0):
+    # 定义在函数内支持将文件直接粘贴到 Linux Kaggle 单元格；loader 使用 fork。
+    class FaceDataset(Dataset):
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, idx):
+            from PIL import Image
+            if paths[idx] in IMAGE_CACHE:
+                shape, pixels = IMAGE_CACHE[paths[idx]]
+                im = Image.frombytes('L', shape, pixels).convert('RGB')
+            else:
+                with Image.open(paths[idx]) as source:
+                    im = source.convert('RGB')  # 灰度复制到 3 通道，保留预训练输入格式
+            if crop < 1:
+                w, h = im.size
+                dx, dy = round(w * (1-crop)/2), round(h * (1-crop)/2)
+                im = im.crop((dx, dy, w-dx, h-dy))
+            return transform(im), int(targets[idx]) if targets is not None else -1
+    return FaceDataset()
+
+
+def transform(size, mean, std, training=False, weak=False):
+    interp = T.InterpolationMode.BICUBIC
+    ops = []
+    if training:
+        # FER 图像已是紧致人脸框，避免大角度旋转、重度裁剪、垂直翻转。
+        ops += [T.RandomResizedCrop(size, scale=(0.92 if weak else 0.85, 1.0),
+                                   ratio=(0.97, 1.03), interpolation=interp),
+                T.RandomHorizontalFlip(0.5),
+                T.RandomAffine(degrees=5 if weak else 10, translate=(0.025, 0.025),
+                               interpolation=interp),
+                T.ColorJitter(brightness=0.08 if weak else 0.15,
+                              contrast=0.08 if weak else 0.15)]
+    else:
+        ops += [T.Resize((size, size), interpolation=interp)]
+    ops += [T.ToTensor(), T.Normalize(mean, std)]
+    if training and not weak:
+        ops += [T.RandomErasing(p=0.10, scale=(0.01, 0.04), ratio=(0.5, 2.0), value=0)]
+    return T.Compose(ops)
+
+
+class EpochOrder:
+    """可直接从已保存微批次的下一张图片继续，不重读前面的 batch。"""
+    def __init__(self, n):
+        self.n, self.seed, self.offset = n, 0, 0
+
+    def set_epoch(self, seed, offset=0):
+        self.seed, self.offset = seed, offset
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed)
+        return iter(torch.randperm(self.n, generator=g).tolist()[self.offset:])
+
+    def __len__(self):
+        return self.n-self.offset
+
+
+def loader(paths, targets, tfm, args, training=False, crop=1.0):
+    if args.workers != 0:
+        raise ValueError('此诊断版本固定 workers=0，避免 Notebook 中加载子进程及缓存复制')
+    sampler = EpochOrder(len(paths)) if training else None
+    return DataLoader(make_dataset(paths, targets, tfm, crop),
+                      batch_size=args.batch_per_gpu, sampler=sampler, shuffle=False,
+                      num_workers=0, pin_memory=True,
+                      generator=torch.Generator().manual_seed(args.seed))
+
+
+def make_model(spec, size, pretrained):
+    kwargs = dict(pretrained=pretrained, num_classes=N_CLASSES, drop_path_rate=0.15)
+    if spec['key'] == 'eva02':
+        kwargs['img_size'] = size
+    with activity(f"构建 {spec['name']}，pretrained={pretrained}（首次会下载权重）"):
+        model = timm.create_model(spec['name'], **kwargs)
+    model.set_grad_checkpointing(USE_GRAD_CHECKPOINT)
+    return model.cuda()
+
+
+def parallel(model):
+    return model  # 固定 cuda:0，避免 DataParallel 每步复制模型与跨卡同步
+
+
+def load_pt(path):
+    return torch.load(path, map_location='cpu', weights_only=False, mmap=os.name != 'nt')
+
+
+def save_pt(obj, path):
+    path = Path(path)
+    tmp = path.with_suffix('.tmp')
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
+def checkpoint(model, score, size, data_cfg, stage, epoch):
+    # 最佳推理权重以 fp16 存盘（恢复时加载回 fp32 参数），节约输出空间。
+    return dict(state={k: v.detach().cpu().half() if v.is_floating_point()
+                       else v.detach().cpu() for k, v in model.state_dict().items()},
+                score=score, size=size, mean=data_cfg['mean'], std=data_cfg['std'],
+                stage=stage, epoch=epoch)
+
+
+def optimizer_for(model, spec, base_lr):
+    buckets = defaultdict(list)
+    for name, param in model.named_parameters():
+        head = name.startswith('head.')
+        # 保守的骨干分层学习率，分类头更快，前层更慢。
+        scale = spec['head_mult'] if head else 1.0
+        if name.startswith(('stem.', 'patch_embed.', 'pos_embed')):
+            scale *= 0.25
+        elif name.startswith(('stages.0.', 'stages.1.', 'blocks.0.', 'blocks.1.', 'blocks.2.')):
+            scale *= 0.5
+        decay = 0.0 if param.ndim <= 1 or name.endswith('.bias') or 'pos_embed' in name else 0.05
+        buckets[(scale, decay)].append(param)
+    groups = [dict(params=params, lr=base_lr * scale, initial_lr=base_lr * scale,
+                   weight_decay=decay) for (scale, decay), params in buckets.items()]
+    return torch.optim.AdamW(groups, foreach=False)
+
+
+@__import__('contextlib').contextmanager
+def amp():
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        yield
+
+
+def smoothed_targets(y, smoothing):
+    targets = F.one_hot(y, N_CLASSES).float()
+    return targets * (1-smoothing) + smoothing / N_CLASSES
+
+
+def train_epoch(net, model, ema, dl, opt, scaler, args, mix, smooth, epoch, epochs, resume_progress=None, save_progress=None):
+    net.train()
+    opt.zero_grad(set_to_none=True)
+    resume_progress = resume_progress or {}
+    total_loss, seen = resume_progress.get('total_loss', 0.0), resume_progress.get('seen', 0)
+    start_batch = resume_progress.get('next_batch', 0)
+    steps = math.ceil(len(dl.dataset)/dl.batch_size)
+    if start_batch > steps or (start_batch % args.accum != 0 and start_batch != steps):
+        raise ValueError('轮内断点不在有效优化步边界')
+    if start_batch == steps:
+        return total_loss/seen, 0.0
+    dl.sampler.set_epoch(args.seed + getattr(args, '_fold', 0)*1000 +
+                         getattr(args, '_stage', 0)*100 + epoch, start_batch*dl.batch_size)
+    start = time.time()
+    last_save = last_tick = start
+    data_seconds, compute_seconds = 0.0, 0.0
+    print(f'[训练] epoch={epoch+1}/{epochs}，共 {steps} 个微批次', flush=True)
+    successful_steps = 0
+    for i, (x, y) in enumerate(dl, start=start_batch):
+        fetched = time.time()
+        data_seconds += fetched-last_tick
+        progress = epoch + i / steps
+        # 前两轮 warmup，此后 cosine decay 到 5% 初始 LR。
+        warmup = min(2, epochs / 5)
+        factor = ((progress+1/steps)/warmup if progress < warmup else
+                  0.05 + 0.95 * (1+math.cos(math.pi * (progress-warmup)/(epochs-warmup))) / 2)
+        for group in opt.param_groups:
+            group['lr'] = group['initial_lr'] * factor
+        if i == start_batch:
+            print('[训练] 首批数据已读取，开始前向和反向计算', flush=True)
+        x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
+        target = smoothed_targets(y, smooth)
+        if mix and random.random() < 0.5:
+            lam = float(np.random.beta(0.2, 0.2))
+            order = torch.randperm(len(x), device=x.device)
+            x = lam*x + (1-lam)*x[order]
+            target = lam*target + (1-lam)*target[order]
+        # 最后不足 accum 个批次时按实际窗口长度归一化。
+        window = min(args.accum, steps - (i // args.accum)*args.accum)
+        with amp():
+            logits = net(x)
+            loss = -(target * F.log_softmax(logits.float(), dim=-1)).sum(-1).mean()
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f'非有限 loss，epoch={epoch}, batch={i}')
+        scaler.scale(loss/window).backward()
+        if (i+1) % args.accum == 0 or i+1 == steps:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            old_scale = scaler.get_scale()
+            scaler.step(opt)
+            scaler.update()
+            if scaler.get_scale() >= old_scale:
+                ema.update(model)
+                successful_steps += 1
+            opt.zero_grad(set_to_none=True)
+        seen += len(x)
+        total_loss += loss.item() * len(x)
+        compute_seconds += time.time()-fetched
+        if i == start_batch or (i+1) % args.log_every == 0 or i+1 == steps:
+            elapsed = time.time()-start
+            eta = elapsed/(i+1-start_batch)*(steps-i-1)/60
+            print(f'  batch {i+1}/{steps}, loss={total_loss/seen:.4f}, '
+                  f'elapsed={elapsed/60:.1f}min, train_epoch_ETA={eta:.1f}min, '
+                  f'data={data_seconds:.1f}s, compute={compute_seconds:.1f}s', flush=True)
+            resource_log(f'epoch{epoch+1}_batch{i+1}')
+        boundary = (i+1) % args.accum == 0 or i+1 == steps
+        if save_progress is not None and boundary and time.time()-last_save >= args.checkpoint_minutes*60:
+            save_progress(dict(next_batch=i+1, total_loss=total_loss, seen=seen))
+            last_save = time.time()
+        last_tick = time.time()
+    if successful_steps == 0:
+        raise FloatingPointError('本轮所有优化步均被 AMP 跳过，请检查数值稳定性')
+    return total_loss/seen, time.time()-start
+
+
+def predict(net, dl, flip=False):
+    net.eval()
+    chunks = []
+    print(f'[推理] {len(dl)} 批，flip={flip}', flush=True)
+    with torch.inference_mode():
+        for batch_index, (x, _) in enumerate(dl):
+            x = x.cuda(non_blocking=True)
+            with amp():
+                p = net(x).float().softmax(-1)
+                if flip:
+                    p = (p + net(x.flip(-1)).float().softmax(-1)) / 2
+            chunks.append(p.cpu().numpy())
+            if batch_index == 0 or (batch_index+1) % 100 == 0:
+                print(f'[推理] batch {batch_index+1}/{len(dl)}', flush=True)
+    result = np.concatenate(chunks)
+    if not np.isfinite(result).all():
+        raise FloatingPointError('推理概率含 NaN/Inf')
+    return result
+
+
+def accuracy(probs, targets):
+    return float((probs.argmax(-1) == targets).mean())
+
+
+def run_fold(spec, fold, rows, test_paths, args, out, signature):
+    stem = out / f"{spec['key']}_fold{fold}"
+    best_path = stem.with_suffix('.best.pt')
+    latest_path = stem.with_suffix('.latest.pt')
+    result_path = stem.with_suffix('.predictions.npz')
+    if result_path.exists():
+        print(f'{stem.name}: 已完成，跳过', flush=True)
+        return
+    seed_all(args.seed + fold * 100 + (10000 if spec['key'] == 'eva02' else 0))
+    tr = [r for r in rows if r['fold'] != fold]
+    va = [r for r in rows if r['fold'] == fold]
+    tr_paths, tr_y = [r['path'] for r in tr], [r['target'] for r in tr]
+    va_paths, va_y = [r['path'] for r in va], np.array([r['target'] for r in va])
+    stages = [(spec['size'], args.epochs, spec['lr'], False),
+              (spec['final_size'], args.finetune_epochs, spec['lr'] * 0.15, True)]
+    resume = load_pt(latest_path) if latest_path.exists() else None
+    if resume is not None and resume['signature'] != signature:
+        raise ValueError('恢复文件与当前配置/输入不匹配，请使用新的输出目录')
+    begin_stage = resume['stage'] if resume else 0
+    if resume:
+        print(f"[恢复] stage={resume['stage']}, epoch={resume['epoch']+1}, next_batch={(resume.get('progress') or {}).get('next_batch', 0)}", flush=True)
+    global_best = load_pt(best_path)['score'] if best_path.exists() else -1
+    for stage in range(begin_stage, len(stages)):
+        size, epochs, lr, weak = stages[stage]
+        if epochs == 0:
+            continue
+        restoring = resume is not None and resume['stage'] == stage
+        model = make_model(spec, size, pretrained=not restoring and stage == 0)
+        cfg = resolve_model_data_config(model)
+        if stage > 0 and not restoring:
+            if not best_path.exists():
+                raise RuntimeError('精调阶段缺少上一阶段最佳权重')
+            # ConvNeXt 可改变输入分辨率，EVA 两阶段保持 448 不变。
+            model.load_state_dict(load_pt(best_path)['state'])
+        if restoring:
+            model.load_state_dict(resume['model'])
+        ema = ModelEmaV2(model, decay=0.999, device='cuda')
+        opt = optimizer_for(model, spec, lr)
+        scaler = torch.amp.GradScaler('cuda')
+        start_epoch, stage_best, stage_best_state = 0, -1, None
+        bad_epochs = 0
+        resume_progress = None
+        if restoring:
+            ema.module.load_state_dict(resume['ema'])
+            opt.load_state_dict(resume['optimizer'])
+            scaler.load_state_dict(resume['scaler'])
+            bad_epochs = resume.get('bad_epochs', 0)
+            resume_progress = resume.get('progress')
+            start_epoch = resume['epoch'] if resume_progress else resume['epoch'] + 1
+            if args.patience > 0 and bad_epochs >= args.patience:
+                start_epoch = epochs
+            stage_best = resume['stage_best']
+            previous_stage_path = Path(str(stem) + f'.stage{stage}.pt')
+            stage_best_state = load_pt(previous_stage_path) if previous_stage_path.exists() else resume.get('stage_best_state')
+            random.setstate(resume['python_rng'])
+            np.random.set_state(resume['numpy_rng'])
+            torch.set_rng_state(resume['torch_rng'])
+            torch.cuda.set_rng_state_all(resume['cuda_rng'])
+        resume = None
+        gc.collect()
+        net = parallel(model)
+        dl_train = loader(tr_paths, tr_y, transform(size, cfg['mean'], cfg['std'], True, weak),
+                          args, True)
+        dl_val = loader(va_paths, va_y, transform(size, cfg['mean'], cfg['std']), args)
+        # 保存各阶段最佳，最终比较使用各自分辨率，避免升分辨率后分数不可回退。
+        stage_path = Path(str(stem) + f'.stage{stage}.pt')
+        winner = None
+        def save_resume(epoch, progress=None):
+            print(f"[保存] 轮内/轮末断点，epoch={epoch+1}, next_batch={(progress or {}).get('next_batch', 0)}", flush=True)
+            resource_log('before_save')
+            save_pt(dict(signature=signature, stage=stage, epoch=epoch, bad_epochs=bad_epochs,
+                         progress=progress, model=model.state_dict(), ema=ema.module.state_dict(),
+                         optimizer=opt.state_dict(), scaler=scaler.state_dict(), stage_best=stage_best,
+                         python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+                         torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all()), latest_path)
+            resource_log('after_save')
+
+        for epoch in range(start_epoch, epochs):
+            args._fold, args._stage = fold, stage
+            loss, elapsed = train_epoch(net, model, ema, dl_train, opt, scaler, args,
+                                        mix=not weak, smooth=0.02 if weak else 0.05,
+                                        epoch=epoch, epochs=epochs, resume_progress=resume_progress,
+                                        save_progress=lambda progress: save_resume(epoch, progress))
+            resume_progress = None
+            # EMA 与原始权重均检查，以避免单独依赖 EMA 的早期滞后。
+            print('[验证] 比较原始权重与 EMA 权重', flush=True)
+            raw_score = accuracy(predict(net, dl_val), va_y)
+            ema_score = accuracy(predict(parallel(ema.module), dl_val), va_y)
+            score = max(raw_score, ema_score)
+            winner = model if raw_score >= ema_score else ema.module
+            print(f'{stem.name} stage={stage} epoch={epoch+1}/{epochs} '
+                  f'loss={loss:.4f} raw_acc={raw_score:.5f} ema_acc={ema_score:.5f} '
+                  f'seconds={elapsed:.0f}', flush=True)
+            if score > stage_best:
+                bad_epochs = 0
+                stage_best = score
+                stage_best_state = checkpoint(winner, score, size, cfg, stage, epoch)
+                save_pt(stage_best_state, stage_path)
+            else:
+                bad_epochs += 1
+            if score > global_best:
+                global_best = score
+                save_pt(stage_best_state, best_path)
+            save_resume(epoch)
+            if args.patience > 0 and bad_epochs >= args.patience:
+                print(f'[早停] 连续 {bad_epochs} 轮验证准确率未提升', flush=True)
+                break
+        # 如果在某阶段末尾中断，stage 文件仍存在，可继续下一阶段。
+        del net, model, ema, opt, scaler, dl_train, dl_val, stage_best_state, winner, save_resume
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # 评估每阶段 clean/flip/crop TTA，阶段与 TTA 选择只用该折验证标签。
+    candidates = []
+    for stage in range(len(stages)):
+        path = Path(str(stem) + f'.stage{stage}.pt')
+        if not path.exists():
+            continue
+        ckpt = load_pt(path)
+        model = make_model(spec, ckpt['size'], False)
+        model.load_state_dict(ckpt['state'])
+        model.set_grad_checkpointing(False)
+        net = parallel(model)
+        tfm = transform(ckpt['size'], ckpt['mean'], ckpt['std'])
+        clean = predict(net, loader(va_paths, va_y, tfm, args))
+        flip = predict(net, loader(va_paths, va_y, tfm, args), flip=True)
+        crop = predict(net, loader(va_paths, va_y, tfm, args, crop=0.92), flip=True)
+        for mode, probs in [('clean', clean), ('flip', flip), ('crop_flip', (flip+crop)/2)]:
+            # 同分时优先较低开销的 clean，然后较早阶段。
+            candidates.append((accuracy(probs, va_y), stage, mode, probs))
+        del net, model, ckpt
+        gc.collect()
+        torch.cuda.empty_cache()
+    score, stage, mode, va_probs = max(candidates, key=lambda c: c[0])
+    ckpt = load_pt(Path(str(stem) + f'.stage{stage}.pt'))
+    ckpt['tta_mode'] = mode
+    ckpt['tta_score'] = score
+    save_pt(ckpt, best_path)
+    model = make_model(spec, ckpt['size'], False)
+    model.load_state_dict(ckpt['state'])
+    model.set_grad_checkpointing(False)
+    net = parallel(model)
+    tfm = transform(ckpt['size'], ckpt['mean'], ckpt['std'])
+    test_probs = predict(net, loader(test_paths, None, tfm, args), flip=mode != 'clean')
+    if mode == 'crop_flip':
+        test_probs = (test_probs + predict(net, loader(test_paths, None, tfm, args, crop=0.92),
+                                          flip=True)) / 2
+    tmp = Path(str(result_path) + '.tmp')
+    with tmp.open('wb') as f:
+        np.savez_compressed(f, indices=np.array([r['index'] for r in va]),
+                            val=va_probs, test=test_probs)
+    tmp.replace(result_path)
+    print(f'{stem.name}: selected stage={stage}, TTA={mode}, val_acc={score:.5f}', flush=True)
+    del net, model, ckpt, candidates
+    latest_path.unlink(missing_ok=True)
+    for s in range(len(stages)):
+        Path(str(stem) + f'.stage{s}.pt').unlink(missing_ok=True)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def ensemble(rows, ids, test_hashes, specs, args, out):
+    ys = np.array([r['target'] for r in rows])
+    all_oof, all_test, individual = [], [], {}
+    fold_metrics = {}
+    selected = list(range(args.n_folds)) if args.folds == 'all' else sorted(set(
+        int(v) for v in args.folds.split(',')))
+    shared_covered = None
+    for spec in specs:
+        oof = np.zeros((len(rows), N_CLASSES), dtype=np.float32)
+        test = np.zeros((len(ids), N_CLASSES), dtype=np.float32)
+        covered = np.zeros(len(rows), dtype=bool)
+        for fold in selected:
+            path = out / f"{spec['key']}_fold{fold}.predictions.npz"
+            if not path.exists():
+                print(f'尚未完成所选折：缺少 {path.name}，本次不生成最终 submission.csv', flush=True)
+                return
+            validate_prediction_file(path, rows, ids, fold)
+            with np.load(path) as z:
+                idx = z['indices']
+                if covered[idx].any():
+                    raise ValueError('OOF 索引重复')
+                oof[idx] = z['val']
+                covered[idx] = True
+                fold_metrics[str(fold)] = accuracy(z['val'], ys[idx])
+                test += z['test'] / len(selected)
+        expected = np.array([r['fold'] in selected for r in rows])
+        if not np.array_equal(covered, expected):
+            raise ValueError('所选验证划分预测不完整')
+        if shared_covered is not None and not np.array_equal(shared_covered, covered):
+            raise ValueError('不同模型的验证样本不一致')
+        shared_covered = covered
+        all_oof.append(oof[covered])
+        all_test.append(test)
+        individual[spec['key']] = accuracy(oof[covered], ys[covered])
+    validation_indices = np.flatnonzero(shared_covered)
+    ys = ys[shared_covered]
+    # 只有 2 个模型时用粗网格，避免过度调整大量融合参数。
+    weights = [np.array([1.0])] if len(specs) == 1 else [
+        np.array([w, 1-w]) for w in [0.5, 0.25, 0.75, 0.0, 1.0]]
+    best = None
+    for w in weights:
+        p = sum(wi*pi for wi, pi in zip(w, all_oof))
+        score = accuracy(p, ys)
+        if best is None or score > best[0]:
+            best = (score, w, p)
+    score, w, oof = best
+    probs = sum(wi*pi for wi, pi in zip(w, all_test))
+    # 输入数据内部已有完全相同的图像：仅当训练标签一致时采用已知标签。
+    # 不使用外部 FER 标签，不读取测试真值；冲突重复样本交给模型预测。
+    matches = []
+    if not args.no_exact_match:
+        known = defaultdict(set)
+        for row in rows:
+            known[row['group']].add(row['target'])
+        for i, digest in enumerate(test_hashes):
+            labels = known.get(digest, set())
+            if len(labels) == 1:
+                label = next(iter(labels))
+                probs[i] = np.eye(N_CLASSES, dtype=np.float32)[label]
+                matches.append({'ID': ids[i], 'Emotion': label})
+    pred = probs.argmax(-1)
+    if probs.shape != (len(ids), N_CLASSES) or not np.isfinite(probs).all():
+        raise ValueError('最终概率异常')
+    if not np.allclose(probs.sum(1), 1, atol=1e-4):
+        raise ValueError('最终概率未归一化')
+    path = out / 'submission.csv'
+    tmp = path.with_suffix('.tmp')
+    with tmp.open('w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['ID', 'Emotion'])
+        writer.writerows((id_, int(y)) for id_, y in zip(ids, pred))
+    tmp.replace(path)
+    np.save(out / 'test_probabilities.npy', probs)
+    np.save(out / 'validation_probabilities.npy', oof)
+    np.save(out / 'validation_indices.npy', validation_indices)
+    confusion = np.zeros((N_CLASSES, N_CLASSES), dtype=int)
+    np.add.at(confusion, (ys, oof.argmax(-1)), 1)
+    atomic_json(dict(individual_oof_accuracy=individual, selected_oof_accuracy=score,
+                     weights={s['key']: float(wi) for s, wi in zip(specs, w)},
+                     class_to_id=CLASS_TO_ID, confusion_matrix=confusion.tolist(),
+                     exact_match_count=len(matches), validation_count=len(ys), selected_folds=selected,
+                     fold_validation_accuracy=fold_metrics,
+                     test_fold_weights={str(f): 1/len(selected) for f in selected},
+                     note='这里是各折未参与训练样本预测的拼接分数，不是三个模型共同预测同一独立验证集的准确率；测试概率按所选折等权平均。' ),
+                out / 'validation_metrics.json')
+    atomic_json(matches, out / 'exact_train_test_matches.json')
+    print(f'OOF accuracy={score:.5f}, weights={w.tolist()}, exact_matches={len(matches)}; '
+          f'提交文件：{path}', flush=True)
+
+
+
+BASELINE_SIGNATURE = '858f4c005d2c82c9ad6add8abee85a45e1b223f624ff95e5d8724b8a860a0438'
+
+
+def resolve_baseline(requested, out):
+    required = ['run_config.json', 'fold_manifest.csv', 'convnext_fold0.predictions.npz']
+    if requested != 'auto':
+        candidates = [Path(requested)]
+    else:
+        candidates = [out, Path('/kaggle/working/task2_copy_output')]
+        candidates += sorted(p.parent for p in Path('/kaggle/input').rglob('convnext_fold0.predictions.npz'))
+    good = []
+    for path in candidates:
+        if not all((path / name).is_file() for name in required):
+            continue
+        config = json.loads((path / 'run_config.json').read_text(encoding='utf-8'))
+        if config.get('signature') == BASELINE_SIGNATURE:
+            good.append(path)
+    if not good:
+        raise FileNotFoundError('找不到匹配的0.714基准结果。请把 task2_baseline_0714.zip 上传为 Kaggle Dataset 并 Add Input；'
+                                '或把 REUSE_DIR/--reuse-dir 设置为含 run_config.json、fold_manifest.csv、'
+                                'convnext_fold0.predictions.npz 的目录。程序不会悄悄重训fold0。')
+    # 当前工作目录优先；多个输入结果必须含相同的 fold0 预测。
+    checksums = {hashlib.sha256((p / required[2]).read_bytes()).hexdigest() for p in good}
+    if len(checksums) != 1:
+        raise ValueError('发现多个不同的fold0结果，请显式指定 REUSE_DIR/--reuse-dir')
+    print(f'[复用] 基准结果目录：{good[0]}', flush=True)
+    return good[0]
+
+
+def apply_saved_folds(rows, baseline, n_folds):
+    with (baseline / 'fold_manifest.csv').open(encoding='utf-8-sig', newline='') as f:
+        saved = list(csv.DictReader(f))
+    if len(rows) != len(saved):
+        raise ValueError('基准训练样本数量与当前数据不一致')
+    group_folds = {}
+    for index, (row, old) in enumerate(zip(rows, saved)):
+        same = (Path(row['path']).name == Path(old['path'].replace('\\', '/')).name
+                and row['target'] == int(old['target']) and row['group'] == old['group']
+                and int(old['index']) == index)
+        if not same:
+            raise ValueError(f'基准样本索引{index}与当前数据不匹配；拒绝复用旧预测')
+        fold = int(old['fold'])
+        if not 0 <= fold < n_folds:
+            raise ValueError('基准 fold 编号非法')
+        if row['group'] in group_folds and group_folds[row['group']] != fold:
+            raise ValueError('基准分折含重复图像跨折泄漏')
+        group_folds[row['group']] = fold
+        row['fold'], row['index'] = fold, index
+    for fold in range(n_folds):
+        labels = {r['target'] for r in rows if r['fold'] == fold}
+        if labels != set(range(N_CLASSES)):
+            raise ValueError(f'第{fold}折缺少类别')
+    print('[分折] 已加载原始 fold_manifest；不会因 sklearn 版本变化重新划分', flush=True)
+
+
+def validate_prediction_file(path, rows, ids, fold):
+    with np.load(path, allow_pickle=False) as z:
+        indices, val, test = z['indices'], z['val'], z['test']
+        expected = np.array([r['index'] for r in rows if r['fold'] == fold])
+        if not np.array_equal(indices, expected):
+            raise ValueError(f'{path.name} 验证索引与冻结分折不一致')
+        for prob, shape in [(val, (len(expected), N_CLASSES)), (test, (len(ids), N_CLASSES))]:
+            if prob.shape != shape or not np.isfinite(prob).all() or (prob < 0).any():
+                raise ValueError(f'{path.name} 概率形状或数值不合法')
+            if not np.allclose(prob.sum(1), 1, atol=1e-4):
+                raise ValueError(f'{path.name} 概率未归一化')
+
+
+def import_baseline(baseline, out, signature, rows, ids):
+    import shutil
+    old = json.loads((baseline / 'run_config.json').read_text(encoding='utf-8'))
+    if old['signature'] != signature:
+        raise ValueError('当前训练配置/测试ID/像素指纹与基准不一致，请保持默认参数或核对数据')
+    source = baseline / 'convnext_fold0.predictions.npz'
+    validate_prediction_file(source, rows, ids, 0)
+    target = out / source.name
+    if source.resolve() != target.resolve():
+        if target.exists() and target.read_bytes() != source.read_bytes():
+            raise ValueError('输出目录已有不同的fold0预测')
+        tmp = target.with_suffix('.tmp')
+        shutil.copyfile(source, tmp)
+        tmp.replace(target)
+    # 只复制明确命名的原始基准提交，避免将三折结果误当作基准。
+    source_csv = baseline / 'submission_baseline_0714.csv'
+    if source_csv.exists() and source_csv.resolve() != (out / source_csv.name).resolve():
+        shutil.copyfile(source_csv, out / source_csv.name)
+    print('[复用完成] fold0 预测已校验，不需要重新训练或重新推理该模型', flush=True)
+
+
+# 直接粘贴时可改下面两个设置，其他训练参数保持默认以便复用基准。
+REUSE_DIR = 'auto'       # 自动查找加入 Input 的基准结果；也可填写实际目录
+TRAIN_FOLDS = '0,1,2'   # 默认跳过已完成0折，只训练1、2折
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-root', default=DEFAULT_ROOT)
+    parser.add_argument('--output', default=DEFAULT_OUT)
+    parser.add_argument('--models', choices=['convnext'], default='convnext')
+    parser.add_argument('--folds', default=TRAIN_FOLDS, help='默认0,1,2，复用第0折并训练第1、2折')
+    parser.add_argument('--reuse-dir', default=REUSE_DIR)
+    parser.add_argument('--prepare-only', action='store_true', help='仅校验数据并导入基准，无需GPU')
+    parser.add_argument('--n-folds', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--finetune-epochs', type=int, default=5)
+    parser.add_argument('--batch-per-gpu', type=int, default=8)
+    parser.add_argument('--accum', type=int, default=8, help='单卡 batch=8，有效 batch=64')
+    parser.add_argument('--backbone', choices=['base', 'tiny'], default='tiny')
+    parser.add_argument('--grad-checkpoint', action='store_true', help='显存不够时打开；会增加计算量')
+    parser.add_argument('--checkpoint-minutes', type=float, default=10)
+    parser.add_argument('--patience', type=int, default=6, help='连续未提升轮数；0 关闭早停')
+    parser.add_argument('--log-every', type=int, default=25)
+    parser.add_argument('--workers', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=2026)
+    parser.add_argument('--audit-only', action='store_true')
+    parser.add_argument('--ensemble-only', action='store_true')
+    parser.add_argument('--no-exact-match', action='store_true',
+                        help='关闭输入数据内部完全相同且标签一致图像的标签复用')
+    args = parser.parse_args(argv)
+    global USE_GRAD_CHECKPOINT, RESOURCE_PATH
+    USE_GRAD_CHECKPOINT = args.grad_checkpoint
+    SPECS[0]['name'] = f'convnext_{args.backbone}.fb_in22k_ft_in1k'
+    if args.workers != 0 or args.checkpoint_minutes <= 0:
+        parser.error('此版本 workers 必须为0，checkpoint-minutes 必须大于0')
+    print(f'[启动] 三模型集成：{args.backbone}，单卡，新增两折各最多25轮', flush=True)
+    if args.log_every < 1 or args.patience < 0:
+        parser.error('log-every >= 1, patience >= 0')
+    if args.n_folds < 2 or args.epochs < 1 or args.finetune_epochs < 0:
+        parser.error('n-folds >= 2, epochs >= 1, finetune-epochs >= 0')
+    if args.batch_per_gpu < 1 or args.accum < 1 or args.workers < 0:
+        parser.error('batch/accum 必须为正数，workers >= 0')
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    RESOURCE_PATH = out / 'resource_stats.jsonl'
+    resource_log('startup')
+    baseline = resolve_baseline(args.reuse_dir, out)
+    with activity('检查图像与提交模板'):
+        rows, test_paths, ids, report, test_hashes = inspect_data(args.data_root)
+    atomic_json(report, out / 'data_audit.json')
+    if args.audit_only:
+        return
+    with activity('加载训练依赖，必要时安装 timm'):
+        setup_ml(require_cuda=not (args.prepare_only or args.ensemble_only))
+    torch.set_num_threads(min(4, os.cpu_count() or 1))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+    resource_log('dependencies_ready')
+    seed_all(args.seed)
+    apply_saved_folds(rows, baseline, args.n_folds)
+    # 同目录不允许不同配置混用。模型/折选择属于调度，可跨会话更改。
+    config = {k: v for k, v in vars(args).items()
+              if k not in {'models', 'folds', 'audit_only', 'ensemble_only', 'data_root', 'output', 'log_every', 'checkpoint_minutes', 'reuse_dir', 'prepare_only'}}
+    config['specs'] = SPECS
+    config['labels'] = CLASS_TO_ID
+    config['manifest'] = hashlib.sha256(json.dumps(
+        [(Path(r['path']).name, r['target'], r['group'], r['fold']) for r in rows],
+        sort_keys=True).encode()).hexdigest()
+    config['test_ids'] = hashlib.sha256('\n'.join(ids).encode()).hexdigest()
+    config['test_pixels'] = hashlib.sha256('\n'.join(test_hashes).encode()).hexdigest()
+    signature = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+    cfg_path = out / 'run_config.json'
+    if cfg_path.exists() and json.loads(cfg_path.read_text(encoding='utf-8'))['signature'] != signature:
+        raise ValueError('此输出目录含不同配置的结果；请指定新的 --output')
+    import_baseline(baseline, out, signature, rows, ids)
+    atomic_json(dict(signature=signature, config=config), cfg_path)
+    with (out / 'fold_manifest.csv').open('w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['path', 'target', 'group', 'fold', 'index'])
+        writer.writeheader()
+        writer.writerows(rows)
+    if args.prepare_only:
+        print('[检查通过] 基准已导入；再次正常运行将只新增fold1、fold2', flush=True)
+        return
+    specs = [s for s in SPECS if args.models == 'both' or s['key'] == args.models]
+    selected = list(range(args.n_folds)) if args.folds == 'all' else sorted(set(int(v) for v in args.folds.split(',')))
+    if not selected or any(f < 0 or f >= args.n_folds for f in selected):
+        parser.error('--folds 必须为合法折编号')
+    print(f'[计划] 模型数={len(specs)}，训练划分={selected}，每划分最多 {args.epochs+args.finetune_epochs} 轮', flush=True)
+    if not args.ensemble_only:
+        for spec in specs:
+            for fold in selected:
+                run_fold(spec, fold, rows, test_paths, args, out, signature)
+    ensemble(rows, ids, test_hashes, specs, args, out)
+
+
+if __name__ == '__main__':
+    # 直接粘贴入 Notebook 时，忽略 IPython 的 -f kernel.json 参数。
+    main([] if 'ipykernel' in sys.modules else None)
