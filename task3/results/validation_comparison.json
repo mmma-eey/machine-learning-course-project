@@ -1,0 +1,80 @@
+{
+  "source_signature": "da6c46253fe2ba0ec9207cde9504dc46ab9847400b145fbb8664bc6001671dbf",
+  "prediction_version": "task3-no-tta-v1",
+  "selected_folds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "fold_weights": {
+    "0": 0.2,
+    "1": 0.2,
+    "2": 0.2,
+    "3": 0.2,
+    "4": 0.2
+  },
+  "tta": 1,
+  "retraining_performed": false,
+  "validation_count": 80,
+  "no_tta_oof_rmse_pixels": 15.061777972155847,
+  "original_tta_oof_rmse_pixels": 21.789568490747257,
+  "no_tta_oof_rmse_x": 18.6231483728844,
+  "no_tta_oof_rmse_y": 10.338890464966306,
+  "validation_improved": true,
+  "fold_metrics": {
+    "0": {
+      "validation_count": 15,
+      "no_tta_rmse_pixels": 9.179289566796152,
+      "original_tta_rmse_pixels": 35.43477434467632,
+      "checkpoint_no_tta_rmse_pixels": 9.179289566796152,
+      "checkpoint_epoch": 6,
+      "checkpoint_weights": "ema",
+      "decoding": "local",
+      "visibility_threshold": 0.0
+    },
+    "1": {
+      "validation_count": 16,
+      "no_tta_rmse_pixels": 27.93728162441687,
+      "original_tta_rmse_pixels": 29.693386263890613,
+      "checkpoint_no_tta_rmse_pixels": 27.93728162441687,
+      "checkpoint_epoch": 4,
+      "checkpoint_weights": "raw",
+      "decoding": "local",
+      "visibility_threshold": 0.0
+    },
+    "2": {
+      "validation_count": 16,
+      "no_tta_rmse_pixels": 9.73266800515951,
+      "original_tta_rmse_pixels": 10.008403276229087,
+      "checkpoint_no_tta_rmse_pixels": 9.73266800515951,
+      "checkpoint_epoch": 11,
+      "checkpoint_weights": "raw",
+      "decoding": "integral",
+      "visibility_threshold": 0.0
+    },
+    "3": {
+      "validation_count": 16,
+      "no_tta_rmse_pixels": 10.31983714278305,
+      "original_tta_rmse_pixels": 11.490005265414664,
+      "checkpoint_no_tta_rmse_pixels": 10.31983714278305,
+      "checkpoint_epoch": 10,
+      "checkpoint_weights": "raw",
+      "decoding": "local",
+      "visibility_threshold": 0.0
+    },
+    "4": {
+      "validation_count": 17,
+      "no_tta_rmse_pixels": 8.321598350811634,
+      "original_tta_rmse_pixels": 8.83278115177418,
+      "checkpoint_no_tta_rmse_pixels": 8.321598350811634,
+      "checkpoint_epoch": 26,
+      "checkpoint_weights": "raw",
+      "decoding": "local",
+      "visibility_threshold": 0.0
+    }
+  },
+  "visibility_threshold": 0.0,
+  "note": "OOF为各折未参与训练样本的拼接分数，不是五模型对同一独立验证集的融合分数；公开榜可能不同。"
+}

@@ -1,0 +1,42 @@
+{
+  "baseline_oof_rmse": 21.789568490747257,
+  "new_oof_rmse": 18.10796794207582,
+  "recommendation": "refined_blend",
+  "selected_folds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "fold_metrics": {
+    "0": {
+      "baseline_rmse": 35.43477434467632,
+      "refined_blend_rmse": 25.10466595110823,
+      "used": true
+    },
+    "1": {
+      "baseline_rmse": 29.693386263890613,
+      "refined_blend_rmse": 27.41375668776526,
+      "used": true
+    },
+    "2": {
+      "baseline_rmse": 10.008403276229087,
+      "refined_blend_rmse": 10.008403276229087,
+      "used": false
+    },
+    "3": {
+      "baseline_rmse": 11.490005265414664,
+      "refined_blend_rmse": 11.490005265414664,
+      "used": false
+    },
+    "4": {
+      "baseline_rmse": 8.83278115177418,
+      "refined_blend_rmse": 7.817694280023531,
+      "used": true
+    }
+  },
+  "blend_alpha": 0.5,
+  "tta_consistent": true,
+  "note": "OOF用于模型选择，有选择偏差；并非五模型对同一独立集的融合分数，不能保证公开榜改善。"
+}
